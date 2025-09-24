@@ -10,10 +10,16 @@
 (define-constant err-expired (err u1006))
 (define-constant err-already-claimed (err u1007))
 (define-constant err-invalid-offer (err u1008))
+(define-constant err-skill-not-found (err u1009))
+(define-constant err-invalid-assessment (err u1010))
+(define-constant err-assessment-exists (err u1011))
+(define-constant err-insufficient-competency (err u1012))
 
 (define-data-var next-program-id uint u1)
 (define-data-var next-offer-id uint u1)
 (define-data-var platform-fee uint u100)
+(define-data-var next-skill-id uint u1)
+(define-data-var next-assessment-id uint u1)
 
 (define-map learning-programs
   { program-id: uint }
@@ -79,6 +85,40 @@
     name: (string-ascii 100),
     verified: bool,
     certifications-issued: uint
+  }
+)
+
+(define-map program-skills
+  { program-id: uint, skill-id: uint }
+  {
+    skill-name: (string-ascii 50),
+    required-level: uint,
+    weight: uint,
+    assessment-type: (string-ascii 20)
+  }
+)
+
+(define-map student-skill-assessments
+  { student: principal, program-id: uint, skill-id: uint }
+  {
+    assessment-id: uint,
+    score: uint,
+    max-score: uint,
+    assessed-at: uint,
+    assessor: principal,
+    competency-level: uint
+  }
+)
+
+(define-map student-competency-profiles
+  { student: principal, program-id: uint }
+  {
+    overall-score: uint,
+    skills-assessed: uint,
+    skills-required: uint,
+    competency-percentage: uint,
+    last-updated: uint,
+    ready-for-jobs: bool
   }
 )
 
@@ -273,6 +313,135 @@
     (var-set platform-fee new-fee)
     (ok new-fee)))
 
+(define-public (define-program-skill
+  (program-id uint)
+  (skill-name (string-ascii 50))
+  (required-level uint)
+  (weight uint)
+  (assessment-type (string-ascii 20)))
+  (let
+    ((program (unwrap! (map-get? learning-programs { program-id: program-id }) err-not-found))
+     (provider tx-sender)
+     (skill-id (var-get next-skill-id)))
+    (asserts! (is-eq provider (get provider program)) err-unauthorized)
+    (asserts! (and (> required-level u0) (<= required-level u100)) err-invalid-assessment)
+    (asserts! (and (> weight u0) (<= weight u100)) err-invalid-assessment)
+    (map-set program-skills
+      { program-id: program-id, skill-id: skill-id }
+      {
+        skill-name: skill-name,
+        required-level: required-level,
+        weight: weight,
+        assessment-type: assessment-type
+      })
+    (var-set next-skill-id (+ skill-id u1))
+    (ok skill-id)))
+
+(define-public (submit-skill-assessment
+  (student principal)
+  (program-id uint)
+  (skill-id uint)
+  (score uint)
+  (max-score uint))
+  (let
+    ((program (unwrap! (map-get? learning-programs { program-id: program-id }) err-not-found))
+     (skill (unwrap! (map-get? program-skills { program-id: program-id, skill-id: skill-id }) err-skill-not-found))
+     (assessor tx-sender)
+     (assessment-id (var-get next-assessment-id))
+     (competency-level (calculate-competency-level score max-score)))
+    (asserts! (is-eq assessor (get certification-authority program)) err-unauthorized)
+    (asserts! (and (> max-score u0) (<= score max-score)) err-invalid-assessment)
+    (asserts! (is-none (map-get? student-skill-assessments { student: student, program-id: program-id, skill-id: skill-id })) err-assessment-exists)
+    (map-set student-skill-assessments
+      { student: student, program-id: program-id, skill-id: skill-id }
+      {
+        assessment-id: assessment-id,
+        score: score,
+        max-score: max-score,
+        assessed-at: stacks-block-height,
+        assessor: assessor,
+        competency-level: competency-level
+      })
+    (var-set next-assessment-id (+ assessment-id u1))
+    (let ((profile-update (update-student-competency-profile student program-id)))
+      (ok assessment-id))))
+
+(define-private (calculate-competency-level (score uint) (max-score uint))
+  (let ((percentage (/ (* score u100) max-score)))
+    (if (>= percentage u90)
+      u5
+      (if (>= percentage u80)
+        u4
+        (if (>= percentage u70)
+          u3
+          (if (>= percentage u60)
+            u2
+            u1))))))
+
+(define-private (update-student-competency-profile (student principal) (program-id uint))
+  (let
+    ((skills-data (get-student-skills-summary student program-id))
+     (overall-score (get overall-score skills-data))
+     (skills-assessed (get skills-assessed skills-data))
+     (skills-required (get-program-skills-count program-id))
+     (competency-percentage (if (> skills-required u0) 
+                             (/ (* skills-assessed u100) skills-required) 
+                             u0))
+     (ready-for-jobs (and (>= competency-percentage u80) 
+                          (>= overall-score u70))))
+    (map-set student-competency-profiles
+      { student: student, program-id: program-id }
+      {
+        overall-score: overall-score,
+        skills-assessed: skills-assessed,
+        skills-required: skills-required,
+        competency-percentage: competency-percentage,
+        last-updated: stacks-block-height,
+        ready-for-jobs: ready-for-jobs
+      })
+    (ok true)))
+
+(define-private (get-student-skills-summary (student principal) (program-id uint))
+  (let
+    ((skill-1 (map-get? student-skill-assessments { student: student, program-id: program-id, skill-id: u1 }))
+     (skill-2 (map-get? student-skill-assessments { student: student, program-id: program-id, skill-id: u2 }))
+     (skill-3 (map-get? student-skill-assessments { student: student, program-id: program-id, skill-id: u3 }))
+     (skill-4 (map-get? student-skill-assessments { student: student, program-id: program-id, skill-id: u4 }))
+     (skill-5 (map-get? student-skill-assessments { student: student, program-id: program-id, skill-id: u5 })))
+    {
+      overall-score: (/ (+ 
+        (get-skill-weighted-score skill-1 program-id u1)
+        (get-skill-weighted-score skill-2 program-id u2)
+        (get-skill-weighted-score skill-3 program-id u3)
+        (get-skill-weighted-score skill-4 program-id u4)
+        (get-skill-weighted-score skill-5 program-id u5)) u5),
+      skills-assessed: (+ 
+        (if (is-some skill-1) u1 u0)
+        (if (is-some skill-2) u1 u0)
+        (if (is-some skill-3) u1 u0)
+        (if (is-some skill-4) u1 u0)
+        (if (is-some skill-5) u1 u0))
+    }))
+
+(define-private (get-skill-weighted-score (skill-opt (optional { assessment-id: uint, score: uint, max-score: uint, assessed-at: uint, assessor: principal, competency-level: uint })) (program-id uint) (skill-id uint))
+  (match skill-opt
+    skill-data
+    (match (map-get? program-skills { program-id: program-id, skill-id: skill-id })
+      skill-config
+      (let ((percentage (/ (* (get score skill-data) u100) (get max-score skill-data)))
+            (weight (get weight skill-config)))
+        (/ (* percentage weight) u100))
+      u0)
+    u0))
+
+(define-private (get-program-skills-count (program-id uint))
+  (+ 
+    (if (is-some (map-get? program-skills { program-id: program-id, skill-id: u1 })) u1 u0)
+    (if (is-some (map-get? program-skills { program-id: program-id, skill-id: u2 })) u1 u0)
+    (if (is-some (map-get? program-skills { program-id: program-id, skill-id: u3 })) u1 u0)
+    (if (is-some (map-get? program-skills { program-id: program-id, skill-id: u4 })) u1 u0)
+    (if (is-some (map-get? program-skills { program-id: program-id, skill-id: u5 })) u1 u0)))
+
 (define-read-only (get-program (program-id uint))
   (map-get? learning-programs { program-id: program-id }))
 
@@ -443,9 +612,76 @@
 
 (define-read-only (calculate-match-score (student principal) (offer-id uint))
   (match (map-get? job-offers { offer-id: offer-id })
-    offer (match (map-get? student-certifications { student: student, program-id: (get required-program-id offer) })
-      cert (if (get verified cert)
-             (+ u50 (/ (get grade cert) u2))
-             u0)
-      u0)
+    offer (match (map-get? student-competency-profiles { student: student, program-id: (get required-program-id offer) })
+      profile (if (get ready-for-jobs profile)
+                (+ u60 (/ (get overall-score profile) u3))
+                (/ (get competency-percentage profile) u2))
+      (match (map-get? student-certifications { student: student, program-id: (get required-program-id offer) })
+        cert (if (get verified cert)
+               (+ u30 (/ (get grade cert) u3))
+               u0)
+        u0))
     u0))
+
+(define-read-only (get-student-skill-profile (student principal) (program-id uint))
+  (let
+    ((profile (map-get? student-competency-profiles { student: student, program-id: program-id }))
+     (skill-1 (map-get? student-skill-assessments { student: student, program-id: program-id, skill-id: u1 }))
+     (skill-2 (map-get? student-skill-assessments { student: student, program-id: program-id, skill-id: u2 }))
+     (skill-3 (map-get? student-skill-assessments { student: student, program-id: program-id, skill-id: u3 })))
+    {
+      competency-profile: profile,
+      skill-assessments: {
+        skill-1: skill-1,
+        skill-2: skill-2,
+        skill-3: skill-3
+      }
+    }))
+
+(define-read-only (get-program-skill-requirements (program-id uint))
+  (let
+    ((skill-1 (map-get? program-skills { program-id: program-id, skill-id: u1 }))
+     (skill-2 (map-get? program-skills { program-id: program-id, skill-id: u2 }))
+     (skill-3 (map-get? program-skills { program-id: program-id, skill-id: u3 }))
+     (skill-4 (map-get? program-skills { program-id: program-id, skill-id: u4 }))
+     (skill-5 (map-get? program-skills { program-id: program-id, skill-id: u5 })))
+    {
+      total-skills: (get-program-skills-count program-id),
+      skills: {
+        skill-1: skill-1,
+        skill-2: skill-2,
+        skill-3: skill-3,
+        skill-4: skill-4,
+        skill-5: skill-5
+      }
+    }))
+
+(define-read-only (get-student-competency-status (student principal) (program-id uint))
+  (match (map-get? student-competency-profiles { student: student, program-id: program-id })
+    profile {
+      ready-for-jobs: (get ready-for-jobs profile),
+      overall-score: (get overall-score profile),
+      completion-rate: (get competency-percentage profile),
+      skills-completed: (get skills-assessed profile),
+      skills-required: (get skills-required profile),
+      last-updated: (get last-updated profile)
+    }
+    {
+      ready-for-jobs: false,
+      overall-score: u0,
+      completion-rate: u0,
+      skills-completed: u0,
+      skills-required: (get-program-skills-count program-id),
+      last-updated: u0
+    }))
+
+(define-read-only (get-enhanced-contract-info)
+  {
+    next-program-id: (var-get next-program-id),
+    next-offer-id: (var-get next-offer-id),
+    next-skill-id: (var-get next-skill-id),
+    next-assessment-id: (var-get next-assessment-id),
+    platform-fee: (var-get platform-fee),
+    contract-owner: contract-owner,
+    current-block: stacks-block-height
+  })
