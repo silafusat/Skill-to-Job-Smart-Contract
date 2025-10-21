@@ -14,12 +14,17 @@
 (define-constant err-invalid-assessment (err u1010))
 (define-constant err-assessment-exists (err u1011))
 (define-constant err-insufficient-competency (err u1012))
+(define-constant err-review-not-allowed (err u1013))
+(define-constant err-already-reviewed (err u1014))
+(define-constant err-invalid-rating (err u1015))
+(define-constant err-review-not-found (err u1016))
 
 (define-data-var next-program-id uint u1)
 (define-data-var next-offer-id uint u1)
 (define-data-var platform-fee uint u100)
 (define-data-var next-skill-id uint u1)
 (define-data-var next-assessment-id uint u1)
+(define-data-var next-review-id uint u1)
 
 (define-map learning-programs
   { program-id: uint }
@@ -120,6 +125,40 @@
     last-updated: uint,
     ready-for-jobs: bool
   }
+)
+
+(define-map employer-reputation
+  { employer: principal }
+  {
+    total-hires: uint,
+    total-reviews: uint,
+    average-rating: uint,
+    response-rate: uint,
+    verified: bool,
+    registration-block: uint
+  }
+)
+
+(define-map student-reviews
+  { review-id: uint }
+  {
+    student: principal,
+    employer: principal,
+    offer-id: uint,
+    rating: uint,
+    review-text: (string-ascii 500),
+    work-environment: uint,
+    compensation-fairness: uint,
+    growth-opportunities: uint,
+    would-recommend: bool,
+    created-at: uint,
+    verified-hire: bool
+  }
+)
+
+(define-map student-employer-reviews
+  { student: principal, employer: principal }
+  uint
 )
 
 (define-public (register-provider (name (string-ascii 100)))
@@ -685,3 +724,195 @@
     contract-owner: contract-owner,
     current-block: stacks-block-height
   })
+
+(define-public (register-employer (employer principal))
+  (begin
+    (asserts! (is-none (map-get? employer-reputation { employer: employer })) err-already-exists)
+    (map-set employer-reputation
+      { employer: employer }
+      {
+        total-hires: u0,
+        total-reviews: u0,
+        average-rating: u0,
+        response-rate: u100,
+        verified: false,
+        registration-block: stacks-block-height
+      })
+    (ok employer)))
+
+(define-public (verify-employer (employer principal))
+  (let
+    ((reputation (unwrap! (map-get? employer-reputation { employer: employer }) err-not-found)))
+    (asserts! (is-eq tx-sender contract-owner) err-unauthorized)
+    (map-set employer-reputation
+      { employer: employer }
+      (merge reputation { verified: true }))
+    (ok true)))
+
+(define-public (submit-employer-review
+  (employer principal)
+  (offer-id uint)
+  (rating uint)
+  (review-text (string-ascii 500))
+  (work-environment uint)
+  (compensation-fairness uint)
+  (growth-opportunities uint)
+  (would-recommend bool))
+  (let
+    ((student tx-sender)
+     (review-id (var-get next-review-id))
+     (offer (unwrap! (map-get? job-offers { offer-id: offer-id }) err-not-found))
+     (application (unwrap! (map-get? job-applications { student: student, offer-id: offer-id }) err-not-found))
+     (reputation (default-to
+                   { total-hires: u0, total-reviews: u0, average-rating: u0, response-rate: u100, verified: false, registration-block: stacks-block-height }
+                   (map-get? employer-reputation { employer: employer }))))
+    (asserts! (is-eq employer (get employer offer)) err-unauthorized)
+    (asserts! (is-eq (get status application) "approved") err-review-not-allowed)
+    (asserts! (is-none (map-get? student-employer-reviews { student: student, employer: employer })) err-already-reviewed)
+    (asserts! (and (>= rating u1) (<= rating u5)) err-invalid-rating)
+    (asserts! (and (>= work-environment u1) (<= work-environment u5)) err-invalid-rating)
+    (asserts! (and (>= compensation-fairness u1) (<= compensation-fairness u5)) err-invalid-rating)
+    (asserts! (and (>= growth-opportunities u1) (<= growth-opportunities u5)) err-invalid-rating)
+    (map-set student-reviews
+      { review-id: review-id }
+      {
+        student: student,
+        employer: employer,
+        offer-id: offer-id,
+        rating: rating,
+        review-text: review-text,
+        work-environment: work-environment,
+        compensation-fairness: compensation-fairness,
+        growth-opportunities: growth-opportunities,
+        would-recommend: would-recommend,
+        created-at: stacks-block-height,
+        verified-hire: true
+      })
+    (map-set student-employer-reviews
+      { student: student, employer: employer }
+      review-id)
+    (let
+      ((new-total-reviews (+ (get total-reviews reputation) u1))
+       (current-total-rating (* (get average-rating reputation) (get total-reviews reputation)))
+       (new-average-rating (/ (+ current-total-rating rating) new-total-reviews)))
+      (map-set employer-reputation
+        { employer: employer }
+        (merge reputation {
+          total-reviews: new-total-reviews,
+          average-rating: new-average-rating
+        })))
+    (var-set next-review-id (+ review-id u1))
+    (ok review-id)))
+
+(define-public (update-employer-hire-count (employer principal))
+  (let
+    ((reputation (unwrap! (map-get? employer-reputation { employer: employer }) err-not-found)))
+    (asserts! (is-eq tx-sender employer) err-unauthorized)
+    (map-set employer-reputation
+      { employer: employer }
+      (merge reputation { total-hires: (+ (get total-hires reputation) u1) }))
+    (ok true)))
+
+(define-read-only (get-employer-reputation (employer principal))
+  (map-get? employer-reputation { employer: employer }))
+
+(define-read-only (get-employer-reviews (employer principal))
+  (let
+    ((review-1 (map-get? student-reviews { review-id: u1 }))
+     (review-2 (map-get? student-reviews { review-id: u2 }))
+     (review-3 (map-get? student-reviews { review-id: u3 }))
+     (review-4 (map-get? student-reviews { review-id: u4 }))
+     (review-5 (map-get? student-reviews { review-id: u5 })))
+    (filter-employer-reviews employer (list review-1 review-2 review-3 review-4 review-5))))
+
+(define-private (filter-employer-reviews (employer principal) (reviews (list 5 (optional { student: principal, employer: principal, offer-id: uint, rating: uint, review-text: (string-ascii 500), work-environment: uint, compensation-fairness: uint, growth-opportunities: uint, would-recommend: bool, created-at: uint, verified-hire: bool }))))
+  (filter is-employer-review-partial reviews))
+
+(define-private (is-employer-review-partial (review-opt (optional { student: principal, employer: principal, offer-id: uint, rating: uint, review-text: (string-ascii 500), work-environment: uint, compensation-fairness: uint, growth-opportunities: uint, would-recommend: bool, created-at: uint, verified-hire: bool })))
+  (match review-opt
+    review (is-eq (get employer review) tx-sender)
+    false))
+
+(define-read-only (get-review (review-id uint))
+  (map-get? student-reviews { review-id: review-id }))
+
+(define-read-only (get-student-review-for-employer (student principal) (employer principal))
+  (match (map-get? student-employer-reviews { student: student, employer: employer })
+    review-id (map-get? student-reviews { review-id: review-id })
+    none))
+
+(define-read-only (calculate-employer-trust-score (employer principal))
+  (match (map-get? employer-reputation { employer: employer })
+    reputation
+    (let
+      ((verified-bonus (if (get verified reputation) u20 u0))
+       (rating-score (* (get average-rating reputation) u10))
+       (review-count-bonus (if (>= (get total-reviews reputation) u10) u15 (/ (* (get total-reviews reputation) u15) u10)))
+       (response-bonus (/ (get response-rate reputation) u10))
+       (hire-count-bonus (if (>= (get total-hires reputation) u5) u10 (/ (* (get total-hires reputation) u10) u5))))
+      (+ verified-bonus rating-score review-count-bonus response-bonus hire-count-bonus))
+    u0))
+
+(define-read-only (get-employer-detailed-stats (employer principal))
+  (match (map-get? employer-reputation { employer: employer })
+    reputation
+    (ok {
+      reputation: reputation,
+      trust-score: (calculate-employer-trust-score employer),
+      active-offers: (count-employer-active-offers employer),
+      recommendation-rate: (calculate-recommendation-rate employer)
+    })
+    err-not-found))
+
+(define-private (count-employer-active-offers (employer principal))
+  (+ 
+    (if (is-active-employer-offer employer u1) u1 u0)
+    (if (is-active-employer-offer employer u2) u1 u0)
+    (if (is-active-employer-offer employer u3) u1 u0)
+    (if (is-active-employer-offer employer u4) u1 u0)
+    (if (is-active-employer-offer employer u5) u1 u0)))
+
+(define-private (is-active-employer-offer (employer principal) (offer-id uint))
+  (match (map-get? job-offers { offer-id: offer-id })
+    offer (and
+            (is-eq (get employer offer) employer)
+            (get active offer)
+            (< stacks-block-height (get expires-at offer))
+            (< (get filled-positions offer) (get max-positions offer)))
+    false))
+
+(define-private (calculate-recommendation-rate (employer principal))
+  (let
+    ((review-1 (map-get? student-reviews { review-id: u1 }))
+     (review-2 (map-get? student-reviews { review-id: u2 }))
+     (review-3 (map-get? student-reviews { review-id: u3 }))
+     (review-4 (map-get? student-reviews { review-id: u4 }))
+     (review-5 (map-get? student-reviews { review-id: u5 })))
+    (let
+      ((total-reviews (+ 
+                        (if (and (is-some review-1) (is-eq employer (get employer (unwrap-panic review-1)))) u1 u0)
+                        (if (and (is-some review-2) (is-eq employer (get employer (unwrap-panic review-2)))) u1 u0)
+                        (if (and (is-some review-3) (is-eq employer (get employer (unwrap-panic review-3)))) u1 u0)
+                        (if (and (is-some review-4) (is-eq employer (get employer (unwrap-panic review-4)))) u1 u0)
+                        (if (and (is-some review-5) (is-eq employer (get employer (unwrap-panic review-5)))) u1 u0)))
+       (recommended-count (+ 
+                            (if (and (is-some review-1) (is-eq employer (get employer (unwrap-panic review-1))) (get would-recommend (unwrap-panic review-1))) u1 u0)
+                            (if (and (is-some review-2) (is-eq employer (get employer (unwrap-panic review-2))) (get would-recommend (unwrap-panic review-2))) u1 u0)
+                            (if (and (is-some review-3) (is-eq employer (get employer (unwrap-panic review-3))) (get would-recommend (unwrap-panic review-3))) u1 u0)
+                            (if (and (is-some review-4) (is-eq employer (get employer (unwrap-panic review-4))) (get would-recommend (unwrap-panic review-4))) u1 u0)
+                            (if (and (is-some review-5) (is-eq employer (get employer (unwrap-panic review-5))) (get would-recommend (unwrap-panic review-5))) u1 u0))))
+      (if (> total-reviews u0)
+        (/ (* recommended-count u100) total-reviews)
+        u0))))
+
+(define-read-only (get-top-rated-employers)
+  (let
+    ((employer-1 (get-employer-if-exists u1))
+     (employer-2 (get-employer-if-exists u2))
+     (employer-3 (get-employer-if-exists u3))
+     (employer-4 (get-employer-if-exists u4))
+     (employer-5 (get-employer-if-exists u5)))
+    (list employer-1 employer-2 employer-3 employer-4 employer-5)))
+
+(define-private (get-employer-if-exists (index uint))
+  none)
